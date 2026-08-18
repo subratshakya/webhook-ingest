@@ -58,32 +58,29 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Close releases all pooled connections.
 func (s *Store) Close() { s.pool.Close() }
 
-// EventExists reports whether an event with this ID has already been stored.
-func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
-	var one int
-	err := s.pool.QueryRow(ctx,
-		`SELECT 1 FROM events WHERE event_id = $1 LIMIT 1`, eventID).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
+// IngestWebhook atomically stores the delivery, updates the call record, and increments account stats.
+// Returns false if the delivery is a duplicate (event_id already exists), true otherwise.
+func (s *Store) IngestWebhook(ctx context.Context, e Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
-	return true, nil
-}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
 
-// InsertEvent stores the raw delivery.
-func (s *Store) InsertEvent(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
-		 VALUES ($1, $2, $3, $4)`,
+		 VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING`,
 		e.EventID, e.CallID, e.AccountID, e.Payload)
-	return err
-}
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil // Duplicate
+	}
 
-// UpsertCall creates or refreshes the call record for this event.
-func (s *Store) UpsertCall(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, now())
 		 ON CONFLICT (call_id) DO UPDATE SET
@@ -92,7 +89,49 @@ func (s *Store) UpsertCall(ctx context.Context, e Event) error {
 		     recording_url = EXCLUDED.recording_url,
 		     updated_at    = now()`,
 		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
-	return err
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec)
+	if err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// GetPendingRecordings returns call IDs that need their recordings processed.
+func (s *Store) GetPendingRecordings(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT call_id FROM calls WHERE recording_url != '' AND recording_processed = FALSE`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pending []string
+	for rows.Next() {
+		var callID string
+		if err := rows.Scan(&callID); err != nil {
+			return nil, err
+		}
+		pending = append(pending, callID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return pending, nil
 }
 
 // MarkRecordingProcessed flags the call's recording as handled.
@@ -100,18 +139,6 @@ func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error
 	_, err := s.pool.Exec(ctx,
 		`UPDATE calls SET recording_processed = TRUE, updated_at = now()
 		 WHERE call_id = $1`, callID)
-	return err
-}
-
-// IncrementAccountStats folds one completed call into the durable aggregate.
-func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, durationSec int) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
-		 VALUES ($1, 1, $2)
-		 ON CONFLICT (account_id) DO UPDATE SET
-		     call_count         = account_stats.call_count + 1,
-		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
-		accountID, durationSec)
 	return err
 }
 
