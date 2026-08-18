@@ -37,15 +37,6 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,26 +52,51 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.IngestWebhook(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			bgCtx := context.Background()
+			if err := s.processRecording(bgCtx, rec); err != nil {
+				s.log.Error("failed to process recording", "call_id", rec.CallID, "err", err)
 			}
 		}()
 	}
 
+	return nil
+}
+
+// RecoverPendingRecordings fetches all pending recordings and processes them.
+func (s *Service) RecoverPendingRecordings(ctx context.Context) error {
+	pending, err := s.store.GetPendingRecordings(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, callID := range pending {
+		rec := store.Event{CallID: callID}
+		go func(r store.Event) {
+			bgCtx := context.Background()
+			if err := s.processRecording(bgCtx, r); err != nil {
+				s.log.Error("failed to process recovered recording", "call_id", r.CallID, "err", err)
+			}
+		}(rec)
+	}
+
+	if len(pending) > 0 {
+		s.log.Info("recovered pending recordings", "count", len(pending))
+	}
 	return nil
 }
 
